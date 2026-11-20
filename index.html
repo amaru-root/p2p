@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sangre en la Arena — Multijugador</title>
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js"></script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{width:100%;height:100%;overflow:hidden;background:#0d0b0b;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#eee}
@@ -86,6 +87,7 @@
 <div id="roomInfo">
   <span>SALA</span><span class="code" id="roomCode">-----</span>
   <button class="sec" id="copyBtn">Copiar link</button>
+  <span id="netInfo" style="font-size:12px;color:#aaa"></span>
 </div>
 
 <div id="overlay">
@@ -112,6 +114,12 @@ const RESPAWN = 3;        // s
 const MED_RESPAWN = 15;   // s
 const MAX_PLAYERS = 16;
 const PREFIX = 'sangre-arena-v1-';
+// Servidores de respaldo (gratis, sin cuenta). Se usan si la conexión directa no funciona.
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://mqtt.eclipseprojects.io:443/mqtt'];
+// OPCIONAL: servidor TURN para mejorar la conexión directa (ej. Metered Open Relay, 20 GB/mes gratis).
+// Pega aquí la URL de credenciales que te da su panel, por ejemplo:
+// 'https://TU-APP.metered.live/api/v1/turn/credentials?apiKey=TU_API_KEY'
+const TURN_CREDENTIALS_URL = '';
 const PEER_OPTS = { debug: 1, config: { iceServers: [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -200,12 +208,14 @@ function tone(freq, dur, vol) {
 
 // ====================== ENTRADA ======================
 const keys = new Set();
-addEventListener('keydown', e => { if (started && GAME_KEYS.has(e.code)) e.preventDefault(); keys.add(e.code); });
+const pressedAt = {};   // recuerda toques rápidos para que ningún disparo se pierda
+addEventListener('keydown', e => { if (started && GAME_KEYS.has(e.code)) e.preventDefault(); if (!e.repeat) pressedAt[e.code] = performance.now(); keys.add(e.code); });
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
 
 function readInput(slot) {
-  const m = KEYMAP[slot], has = arr => arr.some(k => keys.has(k));
+  const now = performance.now();
+  const m = KEYMAP[slot], has = arr => arr.some(k => keys.has(k) || now - (pressedAt[k] || -1e9) < 120);
   const i = { u:has(m.u), d:has(m.d), l:has(m.l), r:has(m.r), f:has(m.f), rl:has(m.rl) };
   const pads = navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean) : [];
   const gp = pads[slot];
@@ -309,30 +319,17 @@ function makeSnap() {
   const e = S.events; S.events = [];
   return { t:'st', p, b, m, e };
 }
-function dropConn(conn) {
-  const i = conns.indexOf(conn); if (i >= 0) conns.splice(i, 1);
-  for (const id of (conn.ids||[])) {
-    const p = S.players[id];
-    if (p) { S.events.push({ t:'l', n:p.name, c:p.color }); delete S.players[id]; delete inputs[id]; }
-  }
-  conn.ids = [];
-  try { conn.close(); } catch(e){}
-}
-function startHostLoop() {
-  let last = performance.now();
-  setInterval(() => {
-    const now = performance.now();
-    let dt = Math.min(0.1, (now-last)/1000); last = now;
-    localIds.forEach((id, s) => inputs[id] = readInput(s));
-    while (dt > 0) { const d = Math.min(dt, 1/60); step(d); dt -= d; }
-    for (const c of [...conns]) if (now - (c.last||now) > 7000) dropConn(c); // sin señal 7s
-    const snap = makeSnap();
-    for (const c of conns) if (c.open && c.ids && c.ids.length) { try { c.send(snap); } catch(e){} }
-    applySnap(snap);
-  }, 1000/30);
-}
-
 // ====================== RED ======================
+// Dos formas de conectar:
+//  1) DIRECTA (WebRTC con PeerJS): la más rápida; funciona en la misma red y en muchas redes por internet.
+//  2) RESPALDO (servidores MQTT públicos por WebSocket seguro): se usa sola si la directa no abre.
+const dec = new TextDecoder();
+const T = () => 'sangrearena/v1/' + roomCode;
+const mqOpts = () => ({ clientId:'sa_' + Math.random().toString(36).slice(2,12), clean:true,
+  connectTimeout:7000, reconnectPeriod:2000, keepalive:20 });
+const relayClients = new Map(), hostBrokers = [];
+let relayEvBuf = [], tick = 0, clientSend = null, netMode = '', directReady = false;
+
 function genCode() { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i=0;i<5;i++) s += c[Math.random()*c.length|0]; return s; }
 function status(t) { $('status').textContent = t; }
 function lockLobby(v) { $('hostBtn').disabled = v; $('joinBtn').disabled = v; }
@@ -342,21 +339,36 @@ function names() {
   try { localStorage.setItem('sa_names', JSON.stringify([$('n1').value, $('n2').value, $('two').checked])); } catch(e){}
   return a;
 }
+function sanitizeNames(n) { return (Array.isArray(n) ? n : []).slice(0, 2).map(x => String(x || 'Jugador').slice(0, 14)); }
 function resetPeer() { if (peer) { try { peer.destroy(); } catch(e){} peer = null; } }
+async function loadIce() {
+  if (!TURN_CREDENTIALS_URL) return;
+  try {
+    const r = await fetch(TURN_CREDENTIALS_URL); const j = await r.json();
+    if (Array.isArray(j) && j.length) PEER_OPTS.config.iceServers = PEER_OPTS.config.iceServers.concat(j);
+  } catch(e) { console.warn('No se pudieron cargar credenciales TURN', e); }
+}
+function removePlayers(ids) {
+  for (const id of ids || []) {
+    const p = S.players[id];
+    if (p) { S.events.push({ t:'l', n:p.name, c:p.color }); delete S.players[id]; delete inputs[id]; }
+  }
+}
 
-function createRoom(tries = 0) {
-  if (typeof Peer === 'undefined') return status('No se pudo cargar PeerJS. Revisa tu conexión a internet.');
+// ---------- ANFITRIÓN ----------
+async function createRoom() {
   ac(); lockLobby(true); status('Creando sala...'); resetPeer();
-  roomCode = genCode();
+  await loadIce();
+  roomCode = genCode(); isHost = true;
+  S = { players:{}, bullets:[], meds:MEDS.map(m => ({ x:m[0], y:m[1], t:0 })), events:[] };
+  const ns = names(); localIds = ns.map((n, i) => 'host#' + i);
+  localIds.forEach((id, i) => hostAddPlayer(id, ns[i]));
+  hostStartPeer(0); hostStartRelays(); startHostLoop(); startGame();
+}
+function hostStartPeer(tries) {
+  if (typeof Peer === 'undefined') return;
   peer = new Peer(PREFIX + roomCode, PEER_OPTS);
-  peer.on('open', () => {
-    if (started) return;
-    isHost = true;
-    S = { players:{}, bullets:[], meds:MEDS.map(m => ({ x:m[0], y:m[1], t:0 })), events:[] };
-    const ns = names(); localIds = ns.map((n, i) => 'host#' + i);
-    localIds.forEach((id, i) => hostAddPlayer(id, ns[i]));
-    startHostLoop(); startGame();
-  });
+  peer.on('open', () => { directReady = true; });
   peer.on('connection', conn => {
     conn.last = performance.now();
     conn.on('open', () => { conns.push(conn); conn.last = performance.now(); });
@@ -364,12 +376,11 @@ function createRoom(tries = 0) {
       conn.last = performance.now();
       if (!msg || typeof msg !== 'object') return;
       if (msg.t === 'join' && !conn.ids) {
-        const ns = (Array.isArray(msg.names) ? msg.names : []).slice(0, 2).map(n => String(n||'Jugador'));
-        if (!ns.length) return;
+        const ns = sanitizeNames(msg.names); if (!ns.length) return;
         if (Object.keys(S.players).length + ns.length > MAX_PLAYERS) { conn.send({ t:'full' }); return; }
-        const ids = ns.map((n, i) => conn.peer + '#' + i);
-        conn.ids = ids; ids.forEach((id, i) => hostAddPlayer(id, ns[i]));
-        conn.send({ t:'welcome', ids, code:roomCode });
+        conn.ids = ns.map((n, i) => conn.peer + '#' + i);
+        conn.ids.forEach((id, i) => hostAddPlayer(id, ns[i]));
+        conn.send({ t:'welcome', ids:conn.ids });
       } else if (msg.t === 'in' && conn.ids && msg.i) {
         for (const id of conn.ids) if (msg.i[id]) inputs[id] = msg.i[id];
       }
@@ -378,52 +389,161 @@ function createRoom(tries = 0) {
     conn.on('error', () => dropConn(conn));
   });
   peer.on('error', err => {
-    if (err.type === 'unavailable-id' && !started && tries < 5) { createRoom(tries+1); return; }
-    if (!started) { status('Error de conexión: ' + err.type); lockLobby(false); }
+    if (err.type === 'unavailable-id' && tries < 3) { directReady = false; resetPeer(); setTimeout(() => hostStartPeer(tries+1), 3000); }
   });
-  peer.on('disconnected', () => { try { if (!peer.destroyed) peer.reconnect(); } catch(e){} });
+  peer.on('disconnected', () => { try { if (peer && !peer.destroyed) peer.reconnect(); } catch(e){} });
+}
+function dropConn(conn) {
+  const i = conns.indexOf(conn); if (i >= 0) conns.splice(i, 1);
+  removePlayers(conn.ids); conn.ids = [];
+  try { conn.close(); } catch(e){}
+}
+function hostStartRelays() {
+  if (typeof mqtt === 'undefined') return;
+  for (const url of BROKERS) {
+    let cl; try { cl = mqtt.connect(url, mqOpts()); } catch(e) { continue; }
+    const br = { url, cl, ok:false }; hostBrokers.push(br);
+    cl.on('connect', () => { br.ok = true; cl.subscribe(T() + '/i', { qos:0 }); });
+    cl.on('close', () => { br.ok = false; });
+    cl.on('error', () => {});
+    cl.on('message', (topic, buf) => { let m; try { m = JSON.parse(dec.decode(buf)); } catch(e) { return; } hostRelayMsg(m, br); });
+  }
+}
+function rcSend(rc, obj) { try { rc.br.cl.publish(T() + '/c/' + rc.cid, JSON.stringify(obj), { qos:1 }); } catch(e){} }
+function hostRelayMsg(m, br) {
+  if (!m || typeof m.from !== 'string' || m.from.length > 40 || !S) return;
+  const now = performance.now(); let rc = relayClients.get(m.from);
+  if (m.t === 'join') {
+    if (rc) { rc.last = now; rcSend(rc, { t:'welcome', ids:rc.ids }); return; }
+    const ns = sanitizeNames(m.names); if (!ns.length) return;
+    if (Object.keys(S.players).length + ns.length > MAX_PLAYERS) {
+      try { br.cl.publish(T() + '/c/' + m.from, JSON.stringify({ t:'full' }), { qos:1 }); } catch(e){} return;
+    }
+    rc = { cid:m.from, br, last:now, ids:ns.map((n, i) => 'r_' + m.from + '#' + i) };
+    relayClients.set(m.from, rc); rc.ids.forEach((id, i) => hostAddPlayer(id, ns[i]));
+    rcSend(rc, { t:'welcome', ids:rc.ids });
+  } else if (m.t === 'in' && rc) {
+    rc.last = now; if (m.i) for (const id of rc.ids) if (m.i[id]) inputs[id] = m.i[id];
+  } else if (m.t === 'bye' && rc) dropRelay(rc);
+}
+function dropRelay(rc) { relayClients.delete(rc.cid); removePlayers(rc.ids); }
+function startHostLoop() {
+  let last = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    let dt = Math.min(0.1, (now-last)/1000); last = now;
+    localIds.forEach((id, s) => inputs[id] = readInput(s));
+    while (dt > 0) { const d = Math.min(dt, 1/60); step(d); dt -= d; }
+    for (const c of [...conns]) if (now - (c.last||now) > 8000) dropConn(c);
+    for (const rc of [...relayClients.values()]) if (now - rc.last > 8000) dropRelay(rc);
+    const snap = makeSnap();
+    for (const c of conns) if (c.open && c.ids && c.ids.length) { try { c.send(snap); } catch(e){} }
+    // respaldo: 15 envíos por segundo, acumulando eventos para no perder ninguno
+    tick++;
+    if (relayClients.size) {
+      relayEvBuf.push(...snap.e);
+      if (tick % 2 === 0) {
+        const payload = JSON.stringify(Object.assign({}, snap, { e:relayEvBuf })); relayEvBuf = [];
+        const used = new Set([...relayClients.values()].map(rc => rc.br));
+        for (const br of used) if (br.ok) { try { br.cl.publish(T() + '/s', payload, { qos:0 }); } catch(e){} }
+      }
+    } else relayEvBuf = [];
+    applySnap(snap);
+  }, 1000/30);
 }
 
+// ---------- INVITADO ----------
 function joinRoom(code) {
-  if (typeof Peer === 'undefined') return status('No se pudo cargar PeerJS. Revisa tu conexión a internet.');
   if (!/^[A-Z0-9]{4,8}$/.test(code)) return status('Escribe un código de sala válido.');
-  ac(); lockLobby(true); status('Conectando a la sala ' + code + '...'); resetPeer();
-  roomCode = code;
+  ac(); lockLobby(true); resetPeer(); roomCode = code;
+  loadIce().then(() => tryDirect(code, ok => { if (!ok && !started) joinViaRelay(code, 0); }));
+}
+function fullRoom() { status('La sala está llena (máx. ' + MAX_PLAYERS + ' jugadores).'); lockLobby(false); resetPeer(); }
+function tryDirect(code, cb) {
+  if (typeof Peer === 'undefined') return cb(false);
+  status('Conectando a la sala ' + code + ' (conexión directa)...');
+  let done = false;
+  const to = setTimeout(() => finish(false), 9000);
+  function finish(ok) { if (done) return; done = true; clearTimeout(to); if (!ok) { hostConn = null; resetPeer(); } cb(ok); }
   peer = new Peer(PEER_OPTS);
-  let timeout = null;
   peer.on('open', () => {
-    hostConn = peer.connect(PREFIX + code, { reliable:true, serialization:'json' });
-    timeout = setTimeout(() => { if (!started) { status('No se pudo conectar (tiempo agotado). ¿El código es correcto?'); lockLobby(false); resetPeer(); } }, 15000);
-    hostConn.on('open', () => hostConn.send({ t:'join', names:names() }));
-    hostConn.on('data', msg => {
+    const conn = peer.connect(PREFIX + code, { reliable:true, serialization:'json' }); hostConn = conn;
+    conn.on('open', () => conn.send({ t:'join', names:names() }));
+    conn.on('data', msg => {
+      if (hostConn !== conn) return;
       lastSnap = performance.now();
-      if (msg.t === 'welcome') { clearTimeout(timeout); localIds = msg.ids; startGame(); startClientInput(); }
-      else if (msg.t === 'st') applySnap(msg);
-      else if (msg.t === 'full') { clearTimeout(timeout); status('La sala está llena (máx. ' + MAX_PLAYERS + ').'); lockLobby(false); resetPeer(); }
+      if (msg.t === 'welcome') {
+        finish(true); localIds = msg.ids; netMode = 'directa';
+        clientSend = o => { if (conn.open) conn.send(o); };
+        startGame(); startClientInput();
+      } else if (msg.t === 'st') applySnap(msg);
+      else if (msg.t === 'full') { done = true; clearTimeout(to); fullRoom(); }
     });
-    hostConn.on('close', () => { if (started) fatal('El anfitrión cerró la sala o se perdió la conexión.'); });
+    conn.on('close', () => { if (started && netMode === 'directa') fatal('El anfitrión cerró la sala o se perdió la conexión.'); });
   });
-  peer.on('error', err => {
-    clearTimeout(timeout);
-    if (!started) {
-      status(err.type === 'peer-unavailable' ? 'Sala no encontrada: ' + code : 'Error de conexión: ' + err.type);
-      lockLobby(false);
-    }
+  peer.on('error', () => finish(false));
+}
+function joinViaRelay(code, idx) {
+  if (typeof mqtt === 'undefined' || idx >= BROKERS.length) {
+    status('No se pudo entrar a la sala ' + code + '. Revisa el código y que el anfitrión siga con la partida abierta.');
+    lockLobby(false); return;
+  }
+  status('La red bloqueó la conexión directa. Probando servidor de respaldo ' + (idx+1) + '/' + BROKERS.length + '...');
+  const cid = 'c' + Math.random().toString(36).slice(2, 12);
+  let cl; try { cl = mqtt.connect(BROKERS[idx], mqOpts()); } catch(e) { return joinViaRelay(code, idx+1); }
+  let welcomed = false, joinTimer = null;
+  const giveUp = setTimeout(() => {
+    if (welcomed) return; clearInterval(joinTimer); try { cl.end(true); } catch(e){}
+    joinViaRelay(code, idx+1);
+  }, 9000);
+  const pub = o => { try { cl.publish(T() + '/i', JSON.stringify(Object.assign({ from:cid }, o)), { qos:0 }); } catch(e){} };
+  cl.on('error', () => {});
+  cl.on('connect', () => {
+    cl.subscribe([T() + '/s', T() + '/c/' + cid], { qos:0 }, () => {
+      if (welcomed) return;
+      const sendJoin = () => pub({ t:'join', names:names() });
+      sendJoin(); clearInterval(joinTimer); joinTimer = setInterval(sendJoin, 1500);
+    });
+  });
+  cl.on('message', (topic, buf) => {
+    let m; try { m = JSON.parse(dec.decode(buf)); } catch(e) { return; }
+    if (topic.endsWith('/c/' + cid)) {
+      if (m.t === 'welcome' && !welcomed) {
+        welcomed = true; clearTimeout(giveUp); clearInterval(joinTimer); lastSnap = performance.now();
+        localIds = m.ids; netMode = 'respaldo (' + new URL(BROKERS[idx]).hostname + ')';
+        clientSend = o => pub(o);
+        addEventListener('beforeunload', () => pub({ t:'bye' }));
+        startGame(); startClientInput();
+      } else if (m.t === 'full' && !welcomed) {
+        clearTimeout(giveUp); clearInterval(joinTimer); try { cl.end(true); } catch(e){} fullRoom();
+      }
+    } else if (welcomed && topic.endsWith('/s')) { lastSnap = performance.now(); applySnap(m); }
   });
 }
 function startClientInput() {
+  let last = '', lastT = 0;
   setInterval(() => {
-    if (!hostConn || !hostConn.open) return;
+    if (!clientSend) return;
     const i = {}; localIds.forEach((id, s) => i[id] = readInput(s));
-    try { hostConn.send({ t:'in', i }); } catch(e){}
+    const str = JSON.stringify(i), now = performance.now();
+    if (str !== last || now - lastT > 250) { last = str; lastT = now; clientSend({ t:'in', i }); }
   }, 1000/30);
 }
+function updateNetInfo() {
+  const el = $('netInfo'); if (!el || !started) return;
+  if (isHost) {
+    const ok = hostBrokers.filter(b => b.ok).length;
+    el.textContent = `Directa ${directReady ? '✓' : '✗'} · Respaldo ${ok}/${BROKERS.length} · ${V.players.size} jugadores`;
+  } else el.textContent = 'Conexión: ' + netMode;
+}
+setInterval(updateNetInfo, 1000);
 function startGame() {
   started = true; startTime = performance.now(); lastSnap = performance.now();
   $('lobby').style.display = 'none';
   $('roomInfo').style.display = 'flex';
   $('roomCode').textContent = roomCode;
   if (document.activeElement) document.activeElement.blur();
+  updateNetInfo();
 }
 function inviteLink() { return location.origin + location.pathname + '?sala=' + roomCode; }
 function fatal(msg) {
@@ -606,7 +726,7 @@ function render(now, dt) {
   ctx.drawImage(wallsC, 0, 0);
 
   // balas (extrapoladas)
-  const el = Math.min(.05, (now - V.snapAt)/1000);
+  const el = Math.min(.1, (now - V.snapAt)/1000);
   ctx.lineCap = 'round';
   for (const b of V.bullets) {
     const cx = Math.cos(b[2]), cy = Math.sin(b[2]), hx = b[0] + cx*BSPEED*el, hy = b[1] + cy*BSPEED*el;
